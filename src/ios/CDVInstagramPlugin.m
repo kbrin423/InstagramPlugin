@@ -1,31 +1,9 @@
-/*
-    The MIT License (MIT)
-    Copyright (c) 2013 - 2014 Vlad Stirbu
-    
-    Permission is hereby granted, free of charge, to any person obtaining
-    a copy of this software and associated documentation files (the
-    "Software"), to deal in the Software without restriction, including
-    without limitation the rights to use, copy, modify, merge, publish,
-    distribute, sublicense, and/or sell copies of the Software, and to
-    permit persons to whom the Software is furnished to do so, subject to
-    the following conditions:
-    
-    The above copyright notice and this permission notice shall be
-    included in all copies or substantial portions of the Software.
-    
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-    NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-    LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-    OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-    WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 #import <Cordova/CDV.h>
 #import "CDVInstagramPlugin.h"
+#import <Photos/Photos.h>
 
 static NSString *InstagramId = @"com.burbn.instagram";
+static NSString *localId;
 
 @implementation CDVInstagramPlugin
 
@@ -33,7 +11,15 @@ static NSString *InstagramId = @"com.burbn.instagram";
 @synthesize callbackId;
 @synthesize interactionController;
 
--(void)isInstalled:(CDVInvokedUrlCommand*)command {
+- (void) receiveSaveImageNotification:(NSNotification *) notification{
+    if ([[notification name] isEqualToString:@"ImageSaved"]){
+        NSURL *instagramURL = [NSURL URLWithString:[NSString stringWithFormat:@"instagram://library?AssetPath=%@", localId]];
+        [[UIApplication sharedApplication] openURL:instagramURL];
+        [[NSNotificationCenter defaultCenter] removeObserver:self];
+    }
+}
+
+- (void)isInstalled:(CDVInvokedUrlCommand*)command {
     self.callbackId = command.callbackId;
     CDVPluginResult *result;
     
@@ -45,34 +31,87 @@ static NSString *InstagramId = @"com.burbn.instagram";
         result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR];
         [self.commandDelegate sendPluginResult:result callbackId: self.callbackId];
     }
-    
+}
+
+void addImageToCameraRoll(UIImage *image) {
+    NSString *albumName = @"Swello Instagram Album";
+
+    void (^saveBlock)(PHAssetCollection *assetCollection) = ^void(PHAssetCollection *assetCollection) {
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            PHAssetChangeRequest *assetChangeRequest = [PHAssetChangeRequest creationRequestForAssetFromImage:image];
+            PHAssetCollectionChangeRequest *assetCollectionChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:assetCollection];
+            [assetCollectionChangeRequest addAssets:@[[assetChangeRequest placeholderForCreatedAsset]]];
+            localId = [[assetChangeRequest placeholderForCreatedAsset] localIdentifier];
+
+        } completionHandler:^(BOOL success, NSError *error) {
+            if (!success) {
+                NSLog(@"Error creating asset: %@", error);
+            } else {
+                [[NSNotificationCenter defaultCenter]
+                postNotificationName:@"ImageSaved"
+                object:nil];
+            }
+        }];
+    };
+
+    PHFetchOptions *fetchOptions = [[PHFetchOptions alloc] init];
+    fetchOptions.predicate = [NSPredicate predicateWithFormat:@"localizedTitle = %@", albumName];
+    PHFetchResult *fetchResult = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum subtype:PHAssetCollectionSubtypeAny options:fetchOptions];
+    if (fetchResult.count > 0) {
+        saveBlock(fetchResult.firstObject);
+    } else {
+        __block PHObjectPlaceholder *albumPlaceholder;
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            PHAssetCollectionChangeRequest *changeRequest = [PHAssetCollectionChangeRequest creationRequestForAssetCollectionWithTitle:albumName];
+            albumPlaceholder = changeRequest.placeholderForCreatedAssetCollection;
+
+        } completionHandler:^(BOOL success, NSError *error) {
+            if (success) {
+                PHFetchResult *fetchResult = [PHAssetCollection fetchAssetCollectionsWithLocalIdentifiers:@[albumPlaceholder.localIdentifier] options:nil];
+                
+                if (fetchResult.count > 0) {
+                    saveBlock(fetchResult.firstObject);
+                }
+            } else {
+                NSLog(@"Error creating album: %@", error);
+            }
+        }];
+    }
 }
 
 - (void)share:(CDVInvokedUrlCommand*)command {
     self.callbackId = command.callbackId;
     self.toInstagram = FALSE;
-    NSString    *objectAtIndex0 = [command argumentAtIndex:0];
-    NSString    *caption = [command argumentAtIndex:1];
+    NSString  *objectAtIndex0 = [command argumentAtIndex:0];
+    NSString *caption = [command argumentAtIndex:1];
     
     CDVPluginResult *result;
     
     NSURL *instagramURL = [NSURL URLWithString:@"instagram://app"];
     if ([[UIApplication sharedApplication] canOpenURL:instagramURL]) {
+        
         NSLog(@"open in instagram");
         
         NSData *imageObj = [[NSData alloc] initWithBase64EncodedString:objectAtIndex0 options:0];
         NSString *tmpDir = NSTemporaryDirectory();
-        NSString *path = [tmpDir stringByAppendingPathComponent:@"instagram.igo"];
+        NSString *path = [tmpDir stringByAppendingPathComponent:@"instagram.ig"];
+        UIImage *image = [UIImage imageWithData:imageObj];
         
-        [imageObj writeToFile:path atomically:true];
+        // Convert UIImage object into NSData (a wrapper for a stream of bytes) formatted according to JPG spec
+        NSData *imageData = UIImageJPEGRepresentation(image, 1);
+        [imageData writeToFile:path atomically:true];
+        
+        [[NSNotificationCenter defaultCenter] addObserver:self
+            selector:@selector(receiveSaveImageNotification:)
+            name:@"ImageSaved"
+            object:nil];
         
         self.interactionController = [UIDocumentInteractionController interactionControllerWithURL:[NSURL fileURLWithPath:path]];
-        self.interactionController .UTI = @"com.instagram.exclusivegram";
         if (caption) {
             self.interactionController .annotation = @{@"InstagramCaption" : caption};
         }
-        self.interactionController .delegate = self;
-        [self.interactionController presentOpenInMenuFromRect:CGRectZero inView:self.webView animated:YES];
+        
+        addImageToCameraRoll(image);
         
     } else {
         result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageToErrorObject:1];
